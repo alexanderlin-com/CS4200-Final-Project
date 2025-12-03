@@ -1,43 +1,57 @@
-#import streamlit
-import streamlit as st
+# chatbot_rag.py
 import os
 from dotenv import load_dotenv
 
-# import pinecone
-from pinecone import Pinecone, ServerlessSpec
+import streamlit as st
+from pinecone import Pinecone
 
-# import langchain
 from langchain_pinecone import PineconeVectorStore
-from langchain_openai import OpenAIEmbeddings
-from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 load_dotenv()
 
-st.title("Chatbot")
+st.title("Me and the Boys — Lore Engine")
 
-# initialize pinecone database
+# --- Vector store / retriever setup ---
 pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
-
-# initialize pinecone database
-index_name = os.environ.get("PINECONE_INDEX_NAME")  # change if desired
+index_name = os.environ.get("PINECONE_INDEX_NAME")
 index = pc.Index(index_name)
 
-# initialize embeddings model + vector store
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large",api_key=os.environ.get("OPENAI_API_KEY"))
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-large",
+    api_key=os.environ.get("OPENAI_API_KEY"),
+)
 vector_store = PineconeVectorStore(index=index, embedding=embeddings)
 
-# initialize chat history
-# initialize chat history
+retriever = vector_store.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 6, "fetch_k": 12, "lambda_mult": 0.5},
+)
+
+# --- Chat history setup ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-    # This is your internal instruction to the AI
-    st.session_state.messages.append(SystemMessage("You are an assistant for question-answering tasks. "))
+    # Internal instruction
+    st.session_state.messages.append(
+        SystemMessage(
+            "You are a lore archivist for the fictional world of 'Me and the Boys'. "
+            "You strictly answer using the provided story context. "
+            "If the context does not contain the answer, say you don't know instead "
+            "of inventing new facts."
+        )
+    )
 
-    # This is the message the user will see from the bot when they open the app
-    st.session_state.messages.append(AIMessage("Hello! I'm Alexander's RAG assistant! Ask me anything about Alexander Lin."))
-# display chat messages from history on app rerun
+    # First visible message
+    st.session_state.messages.append(
+        AIMessage(
+            "Welcome to the **Me and the Boys Lore Engine**.\n\n"
+            "Ask me about characters, battles, magic systems, factions, or events from the story."
+        )
+    )
+
+# Render history
 for message in st.session_state.messages:
     if isinstance(message, HumanMessage):
         with st.chat_message("user"):
@@ -46,65 +60,75 @@ for message in st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(message.content)
 
-# create the bar where we can type messages
-prompt = st.chat_input("How are you?")
+# Input bar
+prompt = st.chat_input("Ask about the story...")
 
-# did the user submit a prompt?
 if prompt:
-    # Add user message to the session state and display it
+    # show user message
     st.session_state.messages.append(HumanMessage(prompt))
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # --- This is where the real work happens ---
-
-    # 1. Initialize the LLM (you can even do this once outside the loop)
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.7) # Temp 1 is for creative writing, not Q&A. Control it.
-
-    # 2. Create the retriever
-    retriever = vector_store.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": 5, "score_threshold": 0.5}, # K=3 is weak. Let's try 5.
-    )
-
-    # 3. Retrieve context FOR THIS PROMPT ONLY
+    # retrieve context
     docs = retriever.invoke(prompt)
-    docs_text = "".join(d.page_content for d in docs)
 
-    # 4. Create the one-time system prompt
-    system_prompt_template = """You are Alexander Lin’s professional advocate. 
-Whenever asked about him, present his background in a polished, professional way, 
-as if introducing him to a hiring manager. Emphasize his strengths, technical skills, 
-and accomplishments in a confident but factual tone. Avoid underselling him. 
-Do not invent new facts—only use the provided context. 
+    if not docs:
+        # no retrieval hits → no bullshit
+        reply_text = (
+            "I couldn't find anything about that in the current story corpus. "
+            "Either it's not written yet, or it's outside the ingested material."
+        )
+        with st.chat_message("assistant"):
+            st.markdown(reply_text)
+        st.session_state.messages.append(AIMessage(reply_text))
+    else:
+        # format context
+        context_blocks = []
+        for i, d in enumerate(docs, 1):
+            meta = d.metadata or {}
+            label = meta.get("source_category", "story")
+            context_blocks.append(
+                f"[DOC {i} | {label}]\n{d.page_content}"
+            )
+        context_str = "\n\n---\n\n".join(context_blocks)
 
-Context: {context}
+        system_prompt = (
+            "You are an in-universe historian and lorekeeper for the world of 'Me and the Boys'.\n"
+            "Use ONLY the following story excerpts to answer the user's question. "
+            "Do not contradict the text. Do not add lore that is not supported.\n\n"
+            f"Story context:\n{context_str}\n\n"
+            "When you answer:\n"
+            "- Be concise but specific.\n"
+            "- If relevant, reference characters, locations, or events by name.\n"
+            "- If the context is ambiguous or missing, say you don't know.\n"
+        )
 
-Now, answer the following question based on the context above:"""
+        messages_for_llm = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=prompt),
+        ]
 
-    system_prompt = system_prompt_template.format(context=docs_text)
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0.4,
+            api_key=os.environ.get("OPENAI_API_KEY"),
+        )
 
-    # 5. Create the message payload FOR THIS INVOCATION ONLY
-    # DO NOT append the system prompt to the session state.
-    messages_for_llm = [
-        SystemMessage(content=system_prompt),
-    ]
-    # Add the last few messages from history for conversational context, if you want.
-    # For now, let's just add the most recent human message.
-    messages_for_llm.append(HumanMessage(prompt))
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
 
+            for chunk in llm.stream(messages_for_llm):
+                delta = getattr(chunk, "content", "") or ""
+                if delta:
+                    full_response += delta
+                    message_placeholder.markdown(full_response)
 
-    # 6. Stream the response token-by-token
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
+            # after answer, show sources
+            st.markdown("\n\n**Sources used:**")
+            for i, d in enumerate(docs, 1):
+                meta = d.metadata or {}
+                src = meta.get("source", "unknown source")
+                st.markdown(f"- DOC {i}: `{src}`")
 
-        # Stream from LangChain's ChatOpenAI
-        for chunk in llm.stream(messages_for_llm):
-            delta = getattr(chunk, "content", "") or ""
-            if delta:
-                full_response += delta
-                message_placeholder.markdown(full_response)
-
-    # 7. Save the final AI message to history
-    st.session_state.messages.append(AIMessage(full_response))
+        st.session_state.messages.append(AIMessage(full_response))
